@@ -35,6 +35,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -60,6 +61,8 @@
 #include "thread_pool.hpp"
 #include "trigonometric_series.hpp"
 #include "type_traits.hpp"
+
+#include <boost/timer/timer.hpp>
 
 namespace piranha
 {
@@ -1283,35 +1286,159 @@ class series_multiplier<Series1,Series2,typename std::enable_if<detail::kronecke
 				}
 			}
 		}
-//		template <typename Functor>
-//		void sparse_multiplication_new(return_type &retval) const
-//		{
-//			const index_type size1 = this->m_v1.size(), size2 = boost::numeric_cast<index_type>(this->m_v2.size());
-//			// Build vectors of bucket positions into retval.
-//			using bucket_idx_type = decltype(retval.m_container._bucket_from_hash(0u));
-//			std::vector<std::pair<term_type1 const *,bucket_idx_type>> bvi1;
-//			std::vector<std::pair<term_type2 const *,bucket_idx_type>> bvi2;
-//			std::transform(this->m_v1.begin(),this->m_v1.end(),std::back_inserter(bvi1),[&retval](term_type1 const *ptr) {
-//				return std::make_pair(ptr,retval.m_container._bucket_from_hash(ptr->hash()));
-//			});
-//			std::transform(this->m_v2.begin(),this->m_v2.end(),std::back_inserter(bvi2),[&retval](term_type2 const *ptr) {
-//				return std::make_pair(ptr,retval.m_container._bucket_from_hash(ptr->hash()));
-//			});
-//			auto cmp1 = [](const std::pair<term_type1 const *,bucket_idx_type> &p1,
-//				const std::pair<term_type1 const *,bucket_idx_type> &p2)
-//			{
-//				return p1.second < p2.second;
-//			};
-//			std::sort(bvi1.begin(),bvi1.end(),cmp1);
-//			auto cmp2 = [](const std::pair<term_type2 const *,bucket_idx_type> &p1,
-//				const std::pair<term_type2 const *,bucket_idx_type> &p2)
-//			{
-//				return p1.second < p2.second;
-//			};
-//			std::sort(bvi2.begin(),bvi2.end(),cmp2);
-//			const auto bucket_count = retval.m_container.bucket_count();
-//			typedef decltype(this->determine_n_threads()) thread_size_type;
-//			const thread_size_type n_threads = this->determine_n_threads();
+		template <typename Functor>
+		void sparse_multiplication_new(return_type &retval) const
+		{
+			// Build vectors of bucket positions into retval.
+			using bucket_idx_type = decltype(retval.m_container._bucket_from_hash(0u));
+			std::vector<std::pair<term_type1 const *,bucket_idx_type>> bvi1;
+			std::vector<std::pair<term_type2 const *,bucket_idx_type>> bvi2;
+			std::transform(this->m_v1.begin(),this->m_v1.end(),std::back_inserter(bvi1),[&retval](term_type1 const *ptr) {
+				return std::make_pair(ptr,retval.m_container._bucket_from_hash(ptr->hash()));
+			});
+			std::transform(this->m_v2.begin(),this->m_v2.end(),std::back_inserter(bvi2),[&retval](term_type2 const *ptr) {
+				return std::make_pair(ptr,retval.m_container._bucket_from_hash(ptr->hash()));
+			});
+			auto cmp1 = [](const std::pair<term_type1 const *,bucket_idx_type> &p1,
+				const std::pair<term_type1 const *,bucket_idx_type> &p2)
+			{
+				return p1.second < p2.second;
+			};
+			std::sort(bvi1.begin(),bvi1.end(),cmp1);
+			auto cmp2 = [](const std::pair<term_type2 const *,bucket_idx_type> &p1,
+				const std::pair<term_type2 const *,bucket_idx_type> &p2)
+			{
+				return p1.second < p2.second;
+			};
+			std::sort(bvi2.begin(),bvi2.end(),cmp2);
+			const bucket_idx_type bucket_count = retval.m_container.bucket_count();
+			typedef decltype(this->determine_n_threads()) thread_size_type;
+			const thread_size_type n_threads = this->determine_n_threads();
+			// Buckets per thread.
+			const auto bpt = bucket_count / n_threads;
+			bucket_size_type insertion_count(0);
+std::mutex m;
+std::vector<integer> n_mults(n_threads);
+			auto thread_function = [n_threads,bpt,bucket_count,&bvi1,&bvi2,cmp2,&retval,&m,&n_mults,&insertion_count](thread_size_type idx) {
+				using it_type2 = decltype(bvi2.cbegin());
+				// This is the range of bucket indices into which the thread is allowed
+				// to write.
+				const auto a = static_cast<bucket_size_type>(bpt * idx),
+					b = (idx == n_threads - 1u) ? bucket_count : static_cast<bucket_size_type>(bpt * (idx + 1u));
+{
+std::lock_guard<std::mutex> lock(m);
+std::cout << "idx,a,b = " << idx << ',' << a << ',' << b << '\n';
+}
+				// Vector of term multiplication tasks to be undertaken by the thread.
+				std::vector<std::tuple<term_type1 const *,it_type2,it_type2>> tasks;
+				it_type2 start, end;
+				const unsigned block_size = 512;
+				for (const auto &bv1: bvi1) {
+					const auto n = bv1.second;
+					start = (a < n) ? bvi2.cbegin() :
+						std::lower_bound(bvi2.cbegin(),bvi2.cend(),
+						std::make_pair(bvi2.cbegin()->first,bucket_idx_type(a - n)),cmp2);
+					end = (b < n) ? bvi2.cbegin() :
+						std::lower_bound(bvi2.cbegin(),bvi2.cend(),
+						std::make_pair(bvi2.cbegin()->first,bucket_idx_type(b - n)),cmp2);
+					if (start != end) {
+						while (end - start > block_size) {
+							tasks.push_back(std::make_tuple(bv1.first,start,start + block_size));
+							start = start + block_size;
+						}
+						tasks.push_back(std::make_tuple(bv1.first,start,end));
+					}
+					start = ((a + bucket_count) < n) ? bvi2.cbegin() :
+						std::lower_bound(bvi2.cbegin(),bvi2.cend(),
+						std::make_pair(bvi2.cbegin()->first,bucket_idx_type((a + bucket_count) - n)),cmp2);
+					end = ((b + bucket_count) < n) ? bvi2.cbegin() :
+						std::lower_bound(bvi2.cbegin(),bvi2.cend(),
+						std::make_pair(bvi2.cbegin()->first,bucket_idx_type((b + bucket_count) - n)),cmp2);
+					if (start != end) {
+						while (end - start > block_size) {
+							tasks.push_back(std::make_tuple(bv1.first,start,start + block_size));
+							start = start + block_size;
+						}
+						tasks.push_back(std::make_tuple(bv1.first,start,end));
+					}
+				}
+				std::sort(tasks.begin(),tasks.end(),[bucket_count,&retval](const std::tuple<term_type1 const *,it_type2,it_type2> &t1,const std::tuple<term_type1 const *,it_type2,it_type2> &t2) {
+					return (retval.m_container._bucket_from_hash(std::get<0u>(t1)->hash()) + retval.m_container._bucket_from_hash(std::get<1u>(t1)->first->hash())) % bucket_count
+						<
+						(retval.m_container._bucket_from_hash(std::get<0u>(t2)->hash()) + retval.m_container._bucket_from_hash(std::get<1u>(t2)->first->hash())) % bucket_count;
+				});
+{
+std::lock_guard<std::mutex> lock(m);
+//std::cout << "idx,task size: " << idx << ',' << tasks.size() << '\n';
+}
+//				for (const auto &t: tasks) {
+//					const auto ptr_b = retval.m_container._bucket_from_hash(std::get<0u>(t)->hash());
+//					const auto low = std::get<1u>(t)->second, high = (std::get<2u>(t) - 1)->second;
+//					if ((ptr_b + low) % bucket_count < a || (ptr_b + high) % bucket_count >= b) {
+//						std::abort();
+//					}
+//					n_mults[idx] += std::distance(std::get<1u>(t),std::get<2u>(t));
+//				}
+				std::vector<term_type2 const *> t2_copy;
+				std::transform(bvi2.cbegin(),bvi2.cend(),std::back_inserter(t2_copy),[](const std::pair<term_type2 const *,bucket_idx_type> &p) {return p.first;});
+				// Perform the multiplication on the selected task.
+				using fast_functor_type = typename Functor::fast_rebind;
+				bucket_size_type ins_count(0);
+				for (const auto &t: tasks) {
+					auto t1_ptr = std::get<0u>(t);
+					auto start = std::get<1u>(t), end = std::get<2u>(t);
+					auto offset = start - bvi2.begin();
+					auto size = end - start;
+					fast_functor_type f(&t1_ptr,1u,&t2_copy[0] + offset,size,retval);
+					for (decltype(size) i = 0; i < size; ++i) {
+						f(0u,i);
+						f.insert();
+					}
+					ins_count += f.m_insertion_count;
+				}
+				std::lock_guard<std::mutex> lock(m);
+				insertion_count += ins_count;
+				
+				
+				
+//				const index_type i_start = task.m_b1.first, j_start = task.m_b2.first,
+//					i_end = task.m_b1.second, j_end = task.m_b2.second;
+//				piranha_assert(i_end > i_start && j_end > j_start);
+//				const index_type i_size = i_end - i_start, j_size = j_end - j_start;
+//				fast_functor_type f(&this->m_v1[0u] + i_start,i_size,&this->m_v2[0u] + j_start,j_size,retval);
+//				for (index_type i = 0u; i < i_size; ++i) {
+//					for (index_type j = 0u; j < j_size; ++j) {
+//						f(i,j);
+//						f.insert();
+//					}
+//				}
+//				tmp_ins_count = f.m_insertion_count;
+			};
+			future_list<decltype(thread_pool::enqueue(0u,thread_function,0u))> f_list;
+			try {
+				for (thread_size_type i = 0u; i < n_threads; ++i) {
+					f_list.push_back(thread_pool::enqueue(i,thread_function,i));
+				}
+				// First let's wait for everything to finish.
+				f_list.wait_all();
+				// Then, let's handle the exceptions.
+				f_list.get_all();
+				// Finally, fix the series.
+				sanitize_series(retval,insertion_count,n_threads);
+			} catch (...) {
+				f_list.wait_all();
+				// Clean up and re-throw.
+				retval.m_container.clear();
+				throw;
+			}
+//std::cout << "tot nmults: " << std::accumulate(n_mults.begin(),n_mults.end(),integer(0)) << '\n';
+			
+			
+			
+			
+			
+			
+			
 //std::cout << "bucket count: " << bucket_count << '\n';
 //std::cout << "min1: " << std::min_element(bvi1.begin(),bvi1.end(),cmp1)->second << '\n';
 //std::cout << "max1: " << std::max_element(bvi1.begin(),bvi1.end(),cmp1)->second << '\n';
@@ -1323,15 +1450,17 @@ class series_multiplier<Series1,Series2,typename std::enable_if<detail::kronecke
 //std::cout << (std::upper_bound(bvi2.begin(),bvi2.end(),std::make_pair(bvi2.begin()->first,b - bvi1.begin()->second),cmp2))->second << '\n';
 //std::cout << (--std::upper_bound(bvi2.begin(),bvi2.end(),std::make_pair(bvi2.begin()->first,b - bvi1.begin()->second),cmp2))->second << '\n';
 
-//		}
+		}
 		template <typename Functor>
 		void sparse_multiplication(return_type &retval) const
 		{
 			const index_type size1 = this->m_v1.size(), size2 = boost::numeric_cast<index_type>(this->m_v2.size());
-//if (size1 > 5000u && size2 > 5000u) {
-//std::cout << "fooooo\n";
-//	sparse_multiplication_new<Functor>(retval);
-//}
+if (size1 > 5000u && size2 > 5000u) {
+std::cout << "fooooo\n";
+boost::timer::auto_cpu_timer t;
+	sparse_multiplication_new<Functor>(retval);
+	return;
+}
 			// Sort the input terms according to the position of the Kronecker keys in the estimated return value.
 			auto sorter1 = [&retval](term_type1 const *ptr1, term_type1 const *ptr2) {
 				return retval.m_container._bucket_from_hash(ptr1->hash()) < retval.m_container._bucket_from_hash(ptr2->hash());
