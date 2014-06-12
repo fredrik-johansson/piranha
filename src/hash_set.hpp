@@ -40,6 +40,8 @@
 #include "debug_access.hpp"
 #include "environment.hpp"
 #include "exceptions.hpp"
+#include "settings.hpp"
+#include "thread_pool.hpp"
 #include "type_traits.hpp"
 
 namespace piranha
@@ -397,21 +399,55 @@ class hash_set
 				if (unlikely(!new_ptr)) {
 					piranha_throw(std::bad_alloc,);
 				}
-				size_type i = 0u;
+				auto thread_function = [this,new_ptr](size_type start, size_type end) {
+					try {
+						// Default-construct the elements of the array.
+						for (; start != end; ++start) {
+							this->m_allocator.construct(&new_ptr[start],list{});
+						}
+					} catch (...) {
+						// Unwind the construction and deallocate, before re-throwing.
+						// NOTE: this should never happen, as the default constructor of list is non-throwing.
+						for (size_type j = 0u; j < start; ++j) {
+							this->m_allocator.destroy(&new_ptr[j]);
+						}
+						throw;
+					}
+				};
+				using thread_size_type = decltype(settings::get_n_threads());
+				const thread_size_type n_threads = settings::get_n_threads();
+				const auto wpt = size / n_threads;
+				future_list<decltype(thread_pool::enqueue(0u,thread_function,0u,0u))> f_list;
 				try {
-					// Default-construct the elements of the array.
-					for (; i < size; ++i) {
-						m_allocator.construct(&new_ptr[i],list{});
+					for (thread_size_type i = 0u; i < n_threads; ++i) {
+						const auto start = wpt * i, end = (i == n_threads - 1u) ? size : wpt * (i + 1u);
+						f_list.push_back(thread_pool::enqueue(i,thread_function,start,end));
 					}
+					f_list.wait_all();
+					f_list.get_all();
 				} catch (...) {
-					// Unwind the construction and deallocate, before re-throwing.
-					// NOTE: this should never happen, as the default constructor of list is non-throwing.
-					for (size_type j = 0u; j < i; ++j) {
-						m_allocator.destroy(&new_ptr[j]);
-					}
+					f_list.wait_all();
 					m_allocator.deallocate(new_ptr,size);
 					throw;
 				}
+
+
+
+//				size_type i = 0u;
+//				try {
+//					// Default-construct the elements of the array.
+//					for (; i < size; ++i) {
+//						m_allocator.construct(&new_ptr[i],list{});
+//					}
+//				} catch (...) {
+//					// Unwind the construction and deallocate, before re-throwing.
+//					// NOTE: this should never happen, as the default constructor of list is non-throwing.
+//					for (size_type j = 0u; j < i; ++j) {
+//						m_allocator.destroy(&new_ptr[j]);
+//					}
+//					m_allocator.deallocate(new_ptr,size);
+//					throw;
+//				}
 				// Assign the members.
 				m_container = new_ptr;
 				m_log2_size = log2_size;
